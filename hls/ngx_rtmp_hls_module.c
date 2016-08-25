@@ -9,8 +9,18 @@
 #include <ngx_rtmp.h>
 #include <ngx_rtmp_cmd_module.h>
 #include <ngx_rtmp_codec_module.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
 #include "ngx_rtmp_mpegts.h"
 
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <netinet/in.h>
+
+#define BUFFER_SIZE 1024  
+#define HTTP_POST "POST /%s HTTP/1.1\r\nHOST: %s:%d\r\nAccept: */*\r\nContent-Type:application/x-www-form-urlencoded\r\nContent-Length: %d\r\n\r\n"
 
 static ngx_rtmp_publish_pt              next_publish;
 static ngx_rtmp_close_stream_pt         next_close_stream;
@@ -28,6 +38,7 @@ static ngx_int_t ngx_rtmp_hls_flush_audio(ngx_rtmp_session_t *s);
 static ngx_int_t ngx_rtmp_hls_ensure_directory(ngx_rtmp_session_t *s,
        ngx_str_t *path);
 
+static void post_filedata(ngx_rtmp_session_t* s);
 
 #define NGX_RTMP_HLS_BUFSIZE            (1024*1024)
 #define NGX_RTMP_HLS_DIR_ACCESS         0744
@@ -114,6 +125,9 @@ typedef struct {
     ngx_str_t                           key_path;
     ngx_str_t                           key_url;
     ngx_uint_t                          frags_per_key;
+    ngx_flag_t                          riak;
+    ngx_str_t                           riak_url;
+ 
 } ngx_rtmp_hls_app_conf_t;
 
 
@@ -306,6 +320,20 @@ static ngx_command_t ngx_rtmp_hls_commands[] = {
       ngx_conf_set_num_slot,
       NGX_RTMP_APP_CONF_OFFSET,
       offsetof(ngx_rtmp_hls_app_conf_t, frags_per_key),
+      NULL },
+
+    { ngx_string("hls_riak"),
+      NGX_RTMP_MAIN_CONF|NGX_RTMP_SRV_CONF|NGX_RTMP_APP_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_flag_slot,
+      NGX_RTMP_APP_CONF_OFFSET,
+      offsetof(ngx_rtmp_hls_app_conf_t, riak),
+      NULL },
+
+    { ngx_string("hls_riak_url"),
+      NGX_RTMP_MAIN_CONF|NGX_RTMP_SRV_CONF|NGX_RTMP_APP_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_RTMP_APP_CONF_OFFSET,
+      offsetof(ngx_rtmp_hls_app_conf_t, riak_url),
       NULL },
 
     ngx_null_command
@@ -814,6 +842,247 @@ ngx_rtmp_hls_get_fragment_id(ngx_rtmp_session_t *s, uint64_t ts)
     }
 }
 
+static void http_tcpclient_close(int socket){  
+    close(socket);  
+}
+
+static int http_tcpclient_create(const char *host, int port, ngx_rtmp_session_t *s){  
+    struct hostent *he;
+    struct sockaddr_in server_addr;
+    int socket_fd;
+
+    if((he = gethostbyname(host))==NULL){  
+    ngx_log_debug0(NGX_LOG_DEBUG_RTMP, s->connection->log, 0, "get host by name error");
+        return -1;  
+    }  
+
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(port);
+    server_addr.sin_addr = *((struct in_addr *)he->h_addr); 
+
+    if((socket_fd = socket(AF_INET,SOCK_STREAM,IPPROTO_TCP))==-1){
+    ngx_log_debug0(NGX_LOG_DEBUG_RTMP, s->connection->log, 0, "socket error");
+        return -1;
+    }
+  
+    if(connect(socket_fd, (struct sockaddr *)&server_addr,sizeof(struct sockaddr)) == -1){
+    ngx_log_debug0(NGX_LOG_DEBUG_RTMP, s->connection->log, 0, "connect error");
+        return -1;
+    }
+
+    return socket_fd;
+}
+
+static int http_tcpclient_send(int socket,char *buff,int size){
+    int sent=0,tmpres=0;
+
+    while(sent < size){
+        tmpres = send(socket,buff+sent,size-sent,0);
+        if(tmpres == -1){
+            return -1;
+        }
+        sent += tmpres;
+    }
+    return sent;
+}
+
+static int http_parse_url(const char *url,char *host,char *file,int *port){
+    char *ptr1,*ptr2;
+    int len = 0;
+    if(!url || !host || !file || !port){
+        return -1;
+    }
+
+    ptr1 = (char *)url;
+
+    if(!strncmp(ptr1,"http://",strlen("http://"))){
+        ptr1 += strlen("http://");
+    }else{
+        return -1;
+    }
+
+    ptr2 = strchr(ptr1,'/');
+    if(ptr2){
+        len = strlen(ptr1) - strlen(ptr2);
+        memcpy(host,ptr1,len);
+        host[len] = '\0';
+        if(*(ptr2 + 1)){
+            memcpy(file,ptr2 + 1,strlen(ptr2) - 1 );
+            file[strlen(ptr2) - 1] = '\0';
+        }
+    }else{
+        memcpy(host,ptr1,strlen(ptr1));
+        host[strlen(ptr1)] = '\0';
+    }
+
+    ptr1 = strchr(host,':');
+    if(ptr1){
+        *ptr1++ = '\0';
+        *port = atoi(ptr1);
+    }else{
+        *port = 80;
+    }
+
+    return 0;
+}
+
+static char * http_post(const char *url,const char *post_str, int nDataSize,ngx_rtmp_session_t *s){
+
+    int socket_fd = -1;
+    char lpbufHeader[BUFFER_SIZE*4] = {'\0'};
+    char host_addr[BUFFER_SIZE] = {'\0'};
+    char file[BUFFER_SIZE] = {'\0'};
+    int port = 0;
+  
+    if(!url || !post_str){
+    ngx_log_debug0(NGX_LOG_DEBUG_RTMP, s->connection->log, 0, "empty url or data");
+        return NULL;
+    }
+
+    if(http_parse_url(url,host_addr,file,&port)){  
+      ngx_log_debug0(NGX_LOG_DEBUG_RTMP, s->connection->log, 0, "parse url fail");
+        return NULL;
+    }
+
+    socket_fd = http_tcpclient_create(host_addr,port,s);
+    if(socket_fd < 0){
+      ngx_log_debug0(NGX_LOG_DEBUG_RTMP, s->connection->log, 0, "create socket fail");
+        return NULL;
+    }
+
+    sprintf(lpbufHeader,HTTP_POST,file,host_addr,port,nDataSize);
+    char* lpbuf = (char*)malloc(nDataSize+strlen(lpbufHeader));
+    memcpy(lpbuf,lpbufHeader,strlen(lpbufHeader));
+    memcpy(lpbuf+strlen(lpbufHeader),post_str,nDataSize);
+    ngx_log_debug1(NGX_LOG_DEBUG_RTMP, s->connection->log, 0, "send content %s", lpbuf);
+    ngx_log_debug1(NGX_LOG_DEBUG_RTMP, s->connection->log, 0, "lpbuf size is %d", (int)strlen(lpbufHeader));
+  
+    int result = http_tcpclient_send(socket_fd,lpbuf,strlen(lpbufHeader)+nDataSize);
+    if(result < 0)
+    {
+        ngx_log_debug0(NGX_LOG_DEBUG_RTMP, s->connection->log, 0, "send fail");
+        return NULL;
+    }
+    else
+    {
+      ngx_log_debug1(NGX_LOG_DEBUG_RTMP, s->connection->log, 0, "send success %d",result);
+    }
+
+    http_tcpclient_close(socket_fd);
+    free(lpbuf);
+
+  return "SUCCESS";
+}
+
+char* get_filename(char* pPath,int nSize,int nNested)
+{
+  int i = nSize;
+  int j = 0; 
+  int nSymbolNum = 0;
+  char* ptr = pPath;
+  if(!nNested)
+  {
+    nSymbolNum = 1;
+  }
+  else
+  {
+    nSymbolNum = 2;
+  }
+
+  ptr+=nSize;
+  while(i-->0)
+  {
+    if((*ptr--) == '/')
+    {
+      j++;
+      if (nSymbolNum == j)
+      {
+        break;
+      }
+    }
+  }
+  ptr+=2;
+  return ptr;
+}
+
+char* get_filedata(const char* szPath, int* nDataSize)
+{
+  FILE* pFile = fopen(szPath,"rb");
+  if(pFile)
+  {
+    fseek(pFile,0,SEEK_END);
+    int nSize = (int)ftell( pFile );
+    *nDataSize = nSize;
+  printf("%d", *nDataSize);
+    char* nData = (char*)malloc(nSize+1);
+    fseek(pFile,0,SEEK_SET);
+    int rst = fread(nData,nSize,1,pFile);
+    rst = rst + 1;
+    fclose(pFile);
+    return nData;
+  }
+  return NULL;
+}
+
+static void post_filedata(ngx_rtmp_session_t* s)
+{
+  ngx_rtmp_hls_app_conf_t *hacf = ngx_rtmp_get_module_app_conf(s, ngx_rtmp_hls_module);
+  
+  if( !hacf || !(hacf->riak) )
+  {
+    ngx_log_debug0(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
+                   "hls: hacf null or  riak flag is off ");
+    return;
+  }
+
+  ngx_rtmp_hls_ctx_t         *ctx;
+  ctx = ngx_rtmp_get_module_ctx(s, ngx_rtmp_hls_module);
+  int nDataSize = 0;
+  char* pFileData = get_filedata((char*)ctx->stream.data,&nDataSize);
+
+  if( !pFileData )
+  {
+    ngx_log_debug0(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
+                   "hls: file data is null ");
+    return;
+  }
+  
+  ngx_log_debug2(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
+                 "hls: file data is  %s,data length is %d",pFileData,nDataSize);
+         
+  char* szName = get_filename((char*)ctx->stream.data,strlen((char*)ctx->stream.data),(int)hacf->nested);
+  char* szFinalUrl = (char*)malloc(strlen((char*)hacf->riak_url.data)+strlen(szName)+1);
+  strcpy(szFinalUrl,(char*)hacf->riak_url.data);
+  strcat(szFinalUrl,szName);
+  ngx_log_debug1(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
+                 "hls: finalUrl is %s",szFinalUrl);
+  http_post(szFinalUrl,pFileData,nDataSize,s);
+  free(szFinalUrl);
+  free(pFileData);
+
+
+  //m3u8
+  int nDataSize1 = 0;
+  char* pM3u8Data = get_filedata((char*)ctx->playlist.data,&nDataSize1);
+  if( !pM3u8Data )
+  {
+    ngx_log_debug0(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
+                   "hls: m3u8 file data is null ");
+    return;
+  }
+  ngx_log_debug2(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
+                 "hls: m3u8 file data is  %s,data length is %d",pM3u8Data,nDataSize1);
+  
+  char* szM3u8Name = get_filename((char*)ctx->playlist.data,(int)ctx->playlist.len,(int)hacf->nested);
+  char* szM3u8FinalUrl = (char*)malloc(strlen((char*)hacf->riak_url.data)+strlen(szM3u8Name)+1);
+  strcpy(szM3u8FinalUrl,(char*)hacf->riak_url.data);
+  strcat(szM3u8FinalUrl,szM3u8Name);
+  ngx_log_debug1(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
+                 "hls: szM3u8FinalUrl is %s",szM3u8FinalUrl);
+  http_post(szM3u8FinalUrl,pM3u8Data,nDataSize1,s);
+  free(szM3u8FinalUrl);
+  free(pM3u8Data);
+}
 
 static ngx_int_t
 ngx_rtmp_hls_close_fragment(ngx_rtmp_session_t *s)
@@ -829,6 +1098,14 @@ ngx_rtmp_hls_close_fragment(ngx_rtmp_session_t *s)
                    "hls: close fragment n=%uL", ctx->frag);
 
     ngx_rtmp_mpegts_close_file(&ctx->file);
+
+    // start
+    ngx_log_debug0(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
+                   "hls: begin post");
+    post_filedata(s);
+    ngx_log_debug0(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
+                   "hls: end post");
+    // stop
 
     ctx->opened = 0;
 
@@ -1496,7 +1773,6 @@ ngx_rtmp_hls_close_stream(ngx_rtmp_session_t *s, ngx_rtmp_close_stream_t *v)
 next:
     return next_close_stream(s, v);
 }
-
 
 static ngx_int_t
 ngx_rtmp_hls_parse_aac_header(ngx_rtmp_session_t *s, ngx_uint_t *objtype,
@@ -2300,6 +2576,7 @@ ngx_rtmp_hls_create_app_conf(ngx_conf_t *cf)
     conf->granularity = NGX_CONF_UNSET;
     conf->keys = NGX_CONF_UNSET;
     conf->frags_per_key = NGX_CONF_UNSET_UINT;
+    conf->riak = NGX_CONF_UNSET;
 
     return conf;
 }
@@ -2338,6 +2615,8 @@ ngx_rtmp_hls_merge_app_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_str_value(conf->key_path, prev->key_path, "");
     ngx_conf_merge_str_value(conf->key_url, prev->key_url, "");
     ngx_conf_merge_uint_value(conf->frags_per_key, prev->frags_per_key, 0);
+    ngx_conf_merge_value(conf->riak, prev->riak, 0);
+    ngx_conf_merge_str_value(conf->riak_url, prev->riak_url, "");
 
     if (conf->fraglen) {
         conf->winfrags = conf->playlen / conf->fraglen;
