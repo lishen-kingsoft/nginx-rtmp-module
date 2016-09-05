@@ -20,12 +20,15 @@
 #include <netinet/in.h>
 
 #define BUFFER_SIZE 1024  
+#define URLS_COUNT 10
 #define HTTP_POST "POST /%s HTTP/1.1\r\nHOST: %s:%d\r\nAccept: */*\r\nContent-Type:application/x-www-form-urlencoded\r\nContent-Length: %d\r\n\r\n"
 
 static ngx_rtmp_publish_pt              next_publish;
 static ngx_rtmp_close_stream_pt         next_close_stream;
 static ngx_rtmp_stream_begin_pt         next_stream_begin;
 static ngx_rtmp_stream_eof_pt           next_stream_eof;
+static char* conf_urls[URLS_COUNT];
+static int nURLS_COUNT;
 
 
 static char * ngx_rtmp_hls_variant(ngx_conf_t *cf, ngx_command_t *cmd,
@@ -38,7 +41,7 @@ static ngx_int_t ngx_rtmp_hls_flush_audio(ngx_rtmp_session_t *s);
 static ngx_int_t ngx_rtmp_hls_ensure_directory(ngx_rtmp_session_t *s,
        ngx_str_t *path);
 
-static void post_filedata(ngx_rtmp_session_t* s);
+static void post_filedata(ngx_rtmp_session_t* s,int nFrag);
 
 #define NGX_RTMP_HLS_BUFSIZE            (1024*1024)
 #define NGX_RTMP_HLS_DIR_ACCESS         0744
@@ -1024,7 +1027,35 @@ char* get_filedata(const char* szPath, int* nDataSize)
   return NULL;
 }
 
-static void post_filedata(ngx_rtmp_session_t* s)
+char* get_riak_url_by_frag(int nFrag)
+{
+  if (nFrag>=nURLS_COUNT)
+  {
+    int n = nFrag%nURLS_COUNT;
+    return conf_urls[n];
+  }
+  return conf_urls[nFrag];
+}
+
+static void fill_conf_urls(ngx_rtmp_hls_app_conf_t* hacf)
+{
+  if( !hacf || !(hacf->riak) )
+  {
+    return;
+  }
+
+  int nCount = 0;
+
+  conf_urls[nCount] = strtok((char*)hacf->riak_url.data,",");
+  while(conf_urls[nCount])
+  {
+    nCount++;
+    conf_urls[nCount] = strtok(NULL,",");
+  }
+  nURLS_COUNT = nCount;
+}
+
+static void post_filedata(ngx_rtmp_session_t* s,int nFrag)
 {
   ngx_rtmp_hls_app_conf_t *hacf = ngx_rtmp_get_module_app_conf(s, ngx_rtmp_hls_module);
   
@@ -1035,24 +1066,26 @@ static void post_filedata(ngx_rtmp_session_t* s)
     return;
   }
 
+  ngx_log_debug2(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
+                 "hls: nFlag is %d, nURLS_COUNT is %d",nFrag, nURLS_COUNT);
+
   ngx_rtmp_hls_ctx_t         *ctx;
   ctx = ngx_rtmp_get_module_ctx(s, ngx_rtmp_hls_module);
+  
+  //ts
   int nDataSize = 0;
   char* pFileData = get_filedata((char*)ctx->stream.data,&nDataSize);
-
   if( !pFileData )
   {
     ngx_log_debug0(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
                    "hls: file data is null ");
     return;
   }
-  
   ngx_log_debug2(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
                  "hls: file data is  %s,data length is %d",pFileData,nDataSize);
-         
   char* szName = get_filename((char*)ctx->stream.data,strlen((char*)ctx->stream.data),(int)hacf->nested);
-  char* szFinalUrl = (char*)malloc(strlen((char*)hacf->riak_url.data)+strlen(szName)+1);
-  strcpy(szFinalUrl,(char*)hacf->riak_url.data);
+  char* szFinalUrl = (char*)malloc(strlen((char*)get_riak_url_by_frag(nFrag))+strlen(szName)+1);
+  strcpy(szFinalUrl,(char*)get_riak_url_by_frag(nFrag));
   strcat(szFinalUrl,szName);
   ngx_log_debug1(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
                  "hls: finalUrl is %s",szFinalUrl);
@@ -1072,10 +1105,9 @@ static void post_filedata(ngx_rtmp_session_t* s)
   }
   ngx_log_debug2(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
                  "hls: m3u8 file data is  %s,data length is %d",pM3u8Data,nDataSize1);
-  
   char* szM3u8Name = get_filename((char*)ctx->playlist.data,(int)ctx->playlist.len,(int)hacf->nested);
-  char* szM3u8FinalUrl = (char*)malloc(strlen((char*)hacf->riak_url.data)+strlen(szM3u8Name)+1);
-  strcpy(szM3u8FinalUrl,(char*)hacf->riak_url.data);
+  char* szM3u8FinalUrl = (char*)malloc(strlen((char*)get_riak_url_by_frag(nFrag))+strlen(szM3u8Name)+1);
+  strcpy(szM3u8FinalUrl,(char*)get_riak_url_by_frag(nFrag));
   strcat(szM3u8FinalUrl,szM3u8Name);
   ngx_log_debug1(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
                  "hls: szM3u8FinalUrl is %s",szM3u8FinalUrl);
@@ -1102,7 +1134,7 @@ ngx_rtmp_hls_close_fragment(ngx_rtmp_session_t *s)
     // start
     ngx_log_debug0(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
                    "hls: begin post");
-    post_filedata(s);
+    post_filedata(s,(int)ctx->frag);
     ngx_log_debug0(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
                    "hls: end post");
     // stop
@@ -2694,6 +2726,8 @@ ngx_rtmp_hls_merge_app_conf(ngx_conf_t *cf, void *parent, void *child)
     if (conf->key_path.len == 0) {
         conf->key_path = conf->path;
     }
+
+    fill_conf_urls(conf);
 
     return NGX_CONF_OK;
 }
