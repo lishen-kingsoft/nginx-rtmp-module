@@ -20,15 +20,14 @@
 #include <netinet/in.h>
 
 #define BUFFER_SIZE 1024  
-#define URLS_COUNT 10
 #define HTTP_POST "POST /%s HTTP/1.1\r\nHOST: %s:%d\r\nAccept: */*\r\nContent-Type:application/x-www-form-urlencoded\r\nContent-Length: %d\r\n\r\n"
+#define HTTP_GET "GET /%s HTTP/1.1\r\nHOST: %s:%d\r\nAccept: */*\r\n\r\n"
+#define HTTP_GET_URL "%s?tsPath=%s&m3u8Path=%s&bucket=%s"
 
 static ngx_rtmp_publish_pt              next_publish;
 static ngx_rtmp_close_stream_pt         next_close_stream;
 static ngx_rtmp_stream_begin_pt         next_stream_begin;
 static ngx_rtmp_stream_eof_pt           next_stream_eof;
-static char* conf_urls[URLS_COUNT];
-static int nURLS_COUNT;
 
 
 static char * ngx_rtmp_hls_variant(ngx_conf_t *cf, ngx_command_t *cmd,
@@ -41,7 +40,7 @@ static ngx_int_t ngx_rtmp_hls_flush_audio(ngx_rtmp_session_t *s);
 static ngx_int_t ngx_rtmp_hls_ensure_directory(ngx_rtmp_session_t *s,
        ngx_str_t *path);
 
-static void post_filedata(ngx_rtmp_session_t* s,int nFrag);
+static void notify_riak_agent(ngx_rtmp_session_t* s);
 
 #define NGX_RTMP_HLS_BUFSIZE            (1024*1024)
 #define NGX_RTMP_HLS_DIR_ACCESS         0744
@@ -929,133 +928,60 @@ static int http_parse_url(const char *url,char *host,char *file,int *port){
     return 0;
 }
 
-static char * http_post(const char *url,const char *post_str, int nDataSize,ngx_rtmp_session_t *s){
+char * http_get(const char *url, ngx_rtmp_session_t *s)  
+{  
 
-    int socket_fd = -1;
-    char lpbufHeader[BUFFER_SIZE*4] = {'\0'};
-    char host_addr[BUFFER_SIZE] = {'\0'};
-    char file[BUFFER_SIZE] = {'\0'};
-    int port = 0;
+    int socket_fd = -1;  
+    char lpbuf[BUFFER_SIZE*4] = {'\0'};  
+    char host_addr[BUFFER_SIZE] = {'\0'};  
+    char file[BUFFER_SIZE] = {'\0'};  
+    int port = 0;  
   
-    if(!url || !post_str){
-    ngx_log_debug0(NGX_LOG_DEBUG_RTMP, s->connection->log, 0, "empty url or data");
-        return NULL;
-    }
-
+    if(!url){
+        ngx_log_debug0(NGX_LOG_DEBUG_RTMP, s->connection->log, 0, "empty url");
+        return NULL;  
+    }  
+  
     if(http_parse_url(url,host_addr,file,&port)){  
-      ngx_log_debug0(NGX_LOG_DEBUG_RTMP, s->connection->log, 0, "parse url fail");
-        return NULL;
+        ngx_log_debug0(NGX_LOG_DEBUG_RTMP, s->connection->log, 0, "parse url fail");
+        return NULL;  
     }
-
-    socket_fd = http_tcpclient_create(host_addr,port,s);
-    if(socket_fd < 0){
-      ngx_log_debug0(NGX_LOG_DEBUG_RTMP, s->connection->log, 0, "create socket fail");
-        return NULL;
-    }
-
-    sprintf(lpbufHeader,HTTP_POST,file,host_addr,port,nDataSize);
-    char* lpbuf = (char*)malloc(nDataSize+strlen(lpbufHeader));
-    memcpy(lpbuf,lpbufHeader,strlen(lpbufHeader));
-    memcpy(lpbuf+strlen(lpbufHeader),post_str,nDataSize);
-    ngx_log_debug1(NGX_LOG_DEBUG_RTMP, s->connection->log, 0, "send content %s", lpbuf);
-    ngx_log_debug1(NGX_LOG_DEBUG_RTMP, s->connection->log, 0, "lpbuf size is %d", (int)strlen(lpbufHeader));
   
-    int result = http_tcpclient_send(socket_fd,lpbuf,strlen(lpbufHeader)+nDataSize);
-    if(result < 0)
-    {
+    socket_fd =  http_tcpclient_create(host_addr,port,s);  
+    if(socket_fd < 0){  
+        ngx_log_debug0(NGX_LOG_DEBUG_RTMP, s->connection->log, 0, "create socket fail");
+        return NULL;  
+    }  
+  
+    sprintf(lpbuf,HTTP_GET,file,host_addr,port);  
+  
+    if(http_tcpclient_send(socket_fd,lpbuf,strlen(lpbuf)) < 0){  
         ngx_log_debug0(NGX_LOG_DEBUG_RTMP, s->connection->log, 0, "send fail");
-        return NULL;
-    }
-    else
-    {
-      ngx_log_debug1(NGX_LOG_DEBUG_RTMP, s->connection->log, 0, "send success %d",result);
+        return NULL;  
     }
 
     http_tcpclient_close(socket_fd);
-    free(lpbuf);
+  
+    return "SUCCESS";
+}  
 
-  return "SUCCESS";
-}
-
-char* get_filename(char* pPath,int nSize,int nNested)
+char* get_bucket(char* szFileName)
 {
-  int i = nSize;
-  int j = 0; 
-  int nSymbolNum = 0;
-  char* ptr = pPath;
-  if(!nNested)
-  {
-    nSymbolNum = 1;
-  }
-  else
-  {
-    nSymbolNum = 2;
-  }
-
-  ptr+=nSize;
-  while(i-->0)
-  {
-    if((*ptr--) == '/')
-    {
-      j++;
-      if (nSymbolNum == j)
-      {
-        break;
-      }
-    }
-  }
-  ptr+=2;
-  return ptr;
-}
-
-char* get_filedata(const char* szPath, int* nDataSize)
-{
-  FILE* pFile = fopen(szPath,"rb");
-  if(pFile)
-  {
-    fseek(pFile,0,SEEK_END);
-    int nSize = (int)ftell( pFile );
-    *nDataSize = nSize;
-  printf("%d", *nDataSize);
-    char* nData = (char*)malloc(nSize+1);
-    fseek(pFile,0,SEEK_SET);
-    int rst = fread(nData,nSize,1,pFile);
-    rst = rst + 1;
-    fclose(pFile);
-    return nData;
-  }
-  return NULL;
-}
-
-char* get_riak_url_by_frag(int nFrag)
-{
-  if (nFrag>=nURLS_COUNT)
-  {
-    int n = nFrag%nURLS_COUNT;
-    return conf_urls[n];
-  }
-  return conf_urls[nFrag];
-}
-
-static void fill_conf_urls(ngx_rtmp_hls_app_conf_t* hacf)
-{
-  if( !hacf || !(hacf->riak) )
-  {
-    return;
-  }
-
   int nCount = 0;
 
-  conf_urls[nCount] = strtok((char*)hacf->riak_url.data,",");
-  while(conf_urls[nCount])
+  char* p[512];
+  p[nCount] = strtok(szFileName, "/");
+  while (p[nCount])
   {
     nCount++;
-    conf_urls[nCount] = strtok(NULL,",");
+    p[nCount] = strtok(NULL, "/");
   }
-  nURLS_COUNT = nCount;
+
+  return p[nCount - 2];
 }
 
-static void post_filedata(ngx_rtmp_session_t* s,int nFrag)
+
+static void notify_riak_agent(ngx_rtmp_session_t* s)
 {
   ngx_rtmp_hls_app_conf_t *hacf = ngx_rtmp_get_module_app_conf(s, ngx_rtmp_hls_module);
   
@@ -1066,54 +992,17 @@ static void post_filedata(ngx_rtmp_session_t* s,int nFrag)
     return;
   }
 
-  ngx_log_debug2(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
-                 "hls: nFlag is %d, nURLS_COUNT is %d",nFrag, nURLS_COUNT);
-
   ngx_rtmp_hls_ctx_t         *ctx;
   ctx = ngx_rtmp_get_module_ctx(s, ngx_rtmp_hls_module);
-  
-  //ts
-  int nDataSize = 0;
-  char* pFileData = get_filedata((char*)ctx->stream.data,&nDataSize);
-  if( !pFileData )
-  {
-    ngx_log_debug0(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
-                   "hls: file data is null ");
-    return;
-  }
-  ngx_log_debug2(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
-                 "hls: file data is  %s,data length is %d",pFileData,nDataSize);
-  char* szName = get_filename((char*)ctx->stream.data,strlen((char*)ctx->stream.data),(int)hacf->nested);
-  char* szFinalUrl = (char*)malloc(strlen((char*)get_riak_url_by_frag(nFrag))+strlen(szName)+1);
-  strcpy(szFinalUrl,(char*)get_riak_url_by_frag(nFrag));
-  strcat(szFinalUrl,szName);
-  ngx_log_debug1(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
-                 "hls: finalUrl is %s",szFinalUrl);
-  http_post(szFinalUrl,pFileData,nDataSize,s);
-  free(szFinalUrl);
-  free(pFileData);
 
-
-  //m3u8
-  int nDataSize1 = 0;
-  char* pM3u8Data = get_filedata((char*)ctx->playlist.data,&nDataSize1);
-  if( !pM3u8Data )
-  {
-    ngx_log_debug0(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
-                   "hls: m3u8 file data is null ");
-    return;
-  }
-  ngx_log_debug2(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
-                 "hls: m3u8 file data is  %s,data length is %d",pM3u8Data,nDataSize1);
-  char* szM3u8Name = get_filename((char*)ctx->playlist.data,(int)ctx->playlist.len,(int)hacf->nested);
-  char* szM3u8FinalUrl = (char*)malloc(strlen((char*)get_riak_url_by_frag(nFrag))+strlen(szM3u8Name)+1);
-  strcpy(szM3u8FinalUrl,(char*)get_riak_url_by_frag(nFrag));
-  strcat(szM3u8FinalUrl,szM3u8Name);
-  ngx_log_debug1(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
-                 "hls: szM3u8FinalUrl is %s",szM3u8FinalUrl);
-  http_post(szM3u8FinalUrl,pM3u8Data,nDataSize1,s);
-  free(szM3u8FinalUrl);
-  free(pM3u8Data);
+  char lpbuf[BUFFER_SIZE] = {'\0'};
+  char* szPath = (char*)malloc(strlen((char*)ctx->stream.data));
+  strcpy(szPath,(char*)ctx->stream.data);
+  char* bucket = get_bucket(szPath);
+  sprintf(lpbuf,HTTP_GET_URL,(char*)hacf->riak_url.data,(char*)ctx->stream.data,(char*)ctx->playlist.data,bucket);
+  ngx_log_debug1(NGX_LOG_DEBUG_RTMP, s->connection->log, 0, "hls: finalUrl is %s",lpbuf);
+  http_get(lpbuf, s);
+  free(szPath);
 }
 
 static ngx_int_t
@@ -1134,7 +1023,7 @@ ngx_rtmp_hls_close_fragment(ngx_rtmp_session_t *s)
     // start
     ngx_log_debug0(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
                    "hls: begin post");
-    post_filedata(s,(int)ctx->frag);
+    notify_riak_agent(s);
     ngx_log_debug0(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
                    "hls: end post");
     // stop
@@ -2726,8 +2615,6 @@ ngx_rtmp_hls_merge_app_conf(ngx_conf_t *cf, void *parent, void *child)
     if (conf->key_path.len == 0) {
         conf->key_path = conf->path;
     }
-
-    fill_conf_urls(conf);
 
     return NGX_CONF_OK;
 }
